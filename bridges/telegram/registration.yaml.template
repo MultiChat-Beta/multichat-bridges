@@ -10,6 +10,11 @@ namespaces:
       exclusive: true
     - regex: ^@telegram_.*:${SYNAPSE_SERVER_NAME}$
       exclusive: true
+    - regex: ^@.*:${SYNAPSE_SERVER_NAME}$
+      exclusive: false
+  aliases:
+    - regex: ^#telegram_.*:${SYNAPSE_SERVER_NAME}$
+      exclusive: true
 de.sorunome.msc2409.push_ephemeral: true
 receive_ephemeral: true
 org.matrix.msc3202: true

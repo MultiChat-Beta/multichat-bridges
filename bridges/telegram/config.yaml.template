@@ -1,14 +1,3 @@
-# Required environment variables:
-#   SYNAPSE_SERVER_NAME          - your Matrix server domain (e.g. example.com)
-#   TELEGRAM_API_ID              - from https://my.telegram.org/apps
-#   TELEGRAM_API_HASH            - from https://my.telegram.org/apps
-#   TELEGRAM_POSTGRES_USER       - postgres username for this bridge
-#   TELEGRAM_POSTGRES_PASSWORD   - postgres password for this bridge
-#   TELEGRAM_POSTGRES_DB         - postgres database name for this bridge
-#   TELEGRAM_AS_TOKEN            - appservice token (auto-generated if not set)
-#   TELEGRAM_HS_TOKEN            - homeserver token (auto-generated if not set)
-#   MULTICHAT_BRIDGE_STATUS_ENDPOINT - (optional) URL to POST bridge status updates
-
 homeserver:
   address: http://synapse:8008
   domain: ${SYNAPSE_SERVER_NAME}
@@ -23,6 +12,14 @@ appservice:
   as_token: "${TELEGRAM_AS_TOKEN}"
   hs_token: "${TELEGRAM_HS_TOKEN}"
   database: postgres://${TELEGRAM_POSTGRES_USER}:${TELEGRAM_POSTGRES_PASSWORD}@postgres_telegram:5432/${TELEGRAM_POSTGRES_DB}?sslmode=disable
+  # Provisioning API — backend talks to this endpoint on behalf of users.
+  # Without an explicit shared_secret, mautrix-python's "generate" default
+  # rotates the secret on every restart (the entrypoint overwrites this file
+  # from the template each boot), which breaks the multichat backend.
+  provisioning:
+    enabled: true
+    prefix: /_matrix/provision
+    shared_secret: "${TELEGRAM_PROVISIONING_TOKEN}"
 
 telegram:
   api_id: ${TELEGRAM_API_ID}
@@ -38,6 +35,8 @@ bridge:
   initial_sync_limit: 1000
   sync_direct_chats: true
   sync_dialog_limit: 1000
+  login_shared_secret_map:
+    ${SYNAPSE_SERVER_NAME}: "as_token:${TELEGRAM_AS_TOKEN}"
   private_chat_portal_meta: true
   initial_power_level_overrides:
     user:
@@ -48,20 +47,12 @@ bridge:
       users_default: 0
       events_default: 0
       invite: 0
-  # Portal rooms (bridged chats) are encrypted. Management DM can stay unencrypted.
-  # Ensure Element: Settings -> Security -> "Never send to unverified" is OFF.
+  # Portal rooms are intentionally unencrypted during the beta simplification period.
   encryption:
-    allow: true
-    default: true
-    appservice: true
+    allow: false
+    default: false
     require: false
-    allow_key_sharing: true
-    self_sign: false
-    msc4190: false
-    verification_levels:
-      receive: unverified
-      send: unverified
-      share: unverified
+    appservice: false
   backfill:
     enable: true
     normal_groups: true
@@ -86,10 +77,3 @@ bridge:
         normal_group: -1
         supergroup: -1
         channel: -1
-
-double_puppet:
-  servers:
-    ${SYNAPSE_SERVER_NAME}: http://synapse:8008
-  allow_discovery: false
-  secrets:
-    ${SYNAPSE_SERVER_NAME}: as_token

@@ -31,8 +31,38 @@ if [ -z "$TELEGRAM_AS_TOKEN" ] || [ -z "$TELEGRAM_HS_TOKEN" ]; then
     fi
 fi
 
+# Provisioning shared secret: prefer the env var supplied by multichat.env,
+# otherwise reuse a value persisted to the data volume so restarts do not
+# rotate the secret. mautrix-python's default "generate" behaviour would
+# otherwise rewrite the secret every boot because the entrypoint regenerates
+# /data/config.yaml from the template each time.
+PROVISIONING_SECRET_FILE="/data/.provisioning_secret"
+gen_provisioning_secret() {
+    s=""
+    if command -v openssl >/dev/null 2>&1; then
+        s=$(openssl rand -base64 48 2>/dev/null | tr -d '\n/+=' | head -c 64)
+    fi
+    if [ -z "$s" ] && command -v python3 >/dev/null 2>&1; then
+        s=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))' 2>/dev/null | tr -d '\n' | head -c 64)
+    fi
+    if [ -z "$s" ]; then
+        s=$(head -c 48 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\n/+=' | head -c 64)
+    fi
+    echo "$s"
+}
+if [ -z "${TELEGRAM_PROVISIONING_TOKEN:-}" ]; then
+    if [ -f "$PROVISIONING_SECRET_FILE" ]; then
+        TELEGRAM_PROVISIONING_TOKEN=$(cat "$PROVISIONING_SECRET_FILE")
+    else
+        TELEGRAM_PROVISIONING_TOKEN=$(gen_provisioning_secret)
+        echo "$TELEGRAM_PROVISIONING_TOKEN" > "$PROVISIONING_SECRET_FILE"
+        chmod 600 "$PROVISIONING_SECRET_FILE"
+    fi
+fi
+export TELEGRAM_PROVISIONING_TOKEN
+
 echo "Generating config from template..."
-envsubst '${TELEGRAM_AS_TOKEN} ${TELEGRAM_HS_TOKEN} ${TELEGRAM_POSTGRES_USER} ${TELEGRAM_POSTGRES_PASSWORD} ${TELEGRAM_POSTGRES_DB} ${TELEGRAM_API_ID} ${TELEGRAM_API_HASH} ${MULTICHAT_BRIDGE_STATUS_ENDPOINT} ${SYNAPSE_SERVER_NAME}' \
+envsubst '${TELEGRAM_AS_TOKEN} ${TELEGRAM_HS_TOKEN} ${TELEGRAM_POSTGRES_USER} ${TELEGRAM_POSTGRES_PASSWORD} ${TELEGRAM_POSTGRES_DB} ${TELEGRAM_API_ID} ${TELEGRAM_API_HASH} ${TELEGRAM_PROVISIONING_TOKEN} ${MULTICHAT_BRIDGE_STATUS_ENDPOINT} ${SYNAPSE_SERVER_NAME}' \
     < "$TEMPLATE_DIR/config.yaml" > "$CONFIG_FILE"
 
 echo "Generating registration from template..."
@@ -69,6 +99,18 @@ if [ -d "$SYNAPSE_APPSERVICES_DIR" ]; then
             if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
                 docker restart "$name" 2>/dev/null && echo "Synapse restarted." && break
             fi
+        done
+        # Wait for Synapse to come back up before mautrix-telegram starts hammering it.
+        # Without this, mautrix-python can race Synapse's appservice cache warmup and
+        # persist an access_token that Synapse later rejects.
+        echo "Waiting for Synapse to be ready..."
+        for i in $(seq 1 30); do
+            sleep 2
+            if wget -q -O /dev/null --timeout=2 http://synapse:8008/health 2>/dev/null || curl -sf --max-time 2 http://synapse:8008/health >/dev/null 2>&1; then
+                echo "Synapse is ready."
+                break
+            fi
+            echo "  Waiting... ($i/30)"
         done
     fi
 fi

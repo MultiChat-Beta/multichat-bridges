@@ -1,10 +1,3 @@
-# Required environment variables:
-#   SYNAPSE_SERVER_NAME          - your Matrix server domain (e.g. example.com)
-#   WHATSAPP_AS_TOKEN            - appservice token (auto-generated if not set)
-#   WHATSAPP_HS_TOKEN            - homeserver token (auto-generated if not set)
-#   WHATSAPP_PICKLE_KEY          - encryption pickle key (auto-generated and persisted)
-#   MULTICHAT_BRIDGE_STATUS_ENDPOINT - (optional) URL to POST bridge status updates
-
 homeserver:
   address: http://synapse:8008
   domain: ${SYNAPSE_SERVER_NAME}
@@ -15,6 +8,30 @@ homeserver:
 network:
   os_name: MultiChat
   browser_name: unknown
+  # Displayname template for WhatsApp ghost puppets.
+  # {{.FullName}}      - Name you set in the contacts list
+  # {{.BusinessName}}  - validated WhatsApp business name
+  # {{.PushName}}      - nickname set by the WhatsApp user
+  # {{.Phone}}         - phone number (international format)
+  # {{.RedactedPhone}} - phone number with middle digits replaced by "∙"
+  #
+  # NEVER put .FullName or .FirstName here. Ghosts are GLOBAL — there is one
+  # @whatsapp_<phone> puppet shared by every user of this bridge — and this template is
+  # re-rendered from whichever login synced that contact last. Address-book fields here
+  # publish one user's private label for a contact to everyone else who has that same
+  # contact saved, in DM room names and group member lists alike. Per-user names belong
+  # in private_chat_name_template below.
+  displayname_template: '{{or .BusinessName .PushName .Phone .RedactedPhone "Unknown user"}}'
+  # Name for DM portal rooms, rendered against the *receiving* login's own contact store.
+  # Portals are per-login (split_portals: true below), so address-book fields are private
+  # here. This is what restores "the name I saved for this person" in the app without the
+  # cross-user leak. Requires the Huddle fork of mautrix-whatsapp (see Dockerfile).
+  private_chat_name_template: '{{or .FullName .FirstName .BusinessName .PushName .Phone}}'
+  history_sync:
+    max_initial_conversations: 50
+    request_full_sync: false
+    dispatch_wait: 15s
+  send_presence_on_typing: true
 
 appservice:
   address: http://whatsapp:29317
@@ -28,34 +45,49 @@ database:
   type: sqlite3-fk-wal
   uri: file:///data/whatsapp.db?_txlock=immediate
 
-# Portal rooms (bridged chats) are encrypted by default. Management DM can stay unencrypted.
-# Ensure Element: Settings -> Security -> "Never send to unverified" is OFF.
+# Portal rooms are intentionally unencrypted during the beta simplification period.
 encryption:
-  allow: true
-  default: true
-  appservice: true
+  allow: false
+  default: false
   require: false
-  allow_key_sharing: true
-  pickle_key: ${WHATSAPP_PICKLE_KEY}
-  self_sign: false
-  msc4190: false
-  verification_levels:
-    receive: unverified
-    send: unverified
-    share: unverified
+  appservice: false
 
 bridge:
   username_template: "whatsapp_%s"
-  displayname_template: "%s"
+  # Same rule as network.displayname_template above: no address-book fields on global ghosts.
+  displayname_template: '{{or .BusinessName .PushName .Phone .RedactedPhone "Unknown user"}}'
   command_prefix: "!wa"
   # Emit bridge connection status updates for all state changes.
   bridge_status_notices: all
+  # Every user gets their own portal rooms, including group chats. Without this, two of our
+  # users sharing a WhatsApp group share one Matrix room, so the other user's u_* account
+  # appears as a member/sender in it. Flipping this changes portal keys: existing shared
+  # group rooms go dormant and the bridge creates fresh per-user rooms (re-backfilled per the
+  # backfill limits) the next time each group is active.
+  split_portals: true
+  # Clean up a login's portal rooms when it is superseded/logged out. With split_portals
+  # every portal has a receiver, so the "private" action covers all of a login's rooms and
+  # never touches other users' portals. "delete" (not kick) so that relinking the same
+  # WhatsApp account from a new app account tears down the old rooms entirely and the new
+  # login re-creates them with correct ghost-puppet history — reusing them leaves the old
+  # account's immutable u_*-sent events (and stale members) in place.
+  # shared_* only apply to receiver-less legacy portals; kept at kick so a room another
+  # user still occupies is never deleted.
+  cleanup_on_logout:
+    enabled: true
+    manual:
+      private: delete
+      relayed: nothing
+      shared_no_users: kick
+      shared_has_users: kick
+    bad_credentials:
+      private: nothing
+      relayed: nothing
+      shared_no_users: nothing
+      shared_has_users: nothing
   permissions:
     "*": user
     "@admin:${SYNAPSE_SERVER_NAME}": admin
-  history_sync:
-    max_initial_conversations: 50
-    request_full_sync: false
 
 backfill:
   enabled: true
@@ -65,6 +97,12 @@ backfill:
   threads:
     max_initial_messages: 25
 
+double_puppet:
+  servers: {}
+  allow_discovery: false
+  secrets:
+    ${SYNAPSE_SERVER_NAME}: "as_token:${WHATSAPP_AS_TOKEN}"
+
 logging:
   level: debug
   writers:
@@ -73,3 +111,13 @@ logging:
     - type: file
       file: /data/whatsapp.log
       level: debug
+
+# Provisioning API — backend talks to this endpoint on behalf of users.
+# We intentionally keep allow_matrix_auth off; auth is enforced by the
+# multichat backend which proxies every call with the shared secret.
+provisioning:
+  prefix: /_matrix/provision
+  shared_secret: ${WHATSAPP_PROVISIONING_SECRET}
+  allow_matrix_auth: false
+  debug_endpoints: false
+  enable_session_transfers: false

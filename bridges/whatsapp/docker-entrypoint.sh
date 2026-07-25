@@ -38,34 +38,43 @@ if [ -z "$WHATSAPP_AS_TOKEN" ] || [ -z "$WHATSAPP_HS_TOKEN" ]; then
     fi
 fi
 
-# Persist pickle_key so config overwrites don't corrupt crypto DB (avoids "supplied account key is invalid")
-PICKLE_KEY_FILE="/data/.pickle_key"
-if [ -f "$PICKLE_KEY_FILE" ]; then
-    WHATSAPP_PICKLE_KEY=$(cat "$PICKLE_KEY_FILE")
-else
-    WHATSAPP_PICKLE_KEY=$(gen_token)
-    echo "$WHATSAPP_PICKLE_KEY" > "$PICKLE_KEY_FILE"
-    chmod 600 "$PICKLE_KEY_FILE"
+# Provisioning secret: persist once so restarts don't rotate it.
+PROVISIONING_SECRET_FILE="/data/.provisioning_secret"
+if [ -z "${WHATSAPP_PROVISIONING_SECRET:-}" ]; then
+    if [ -f "$PROVISIONING_SECRET_FILE" ]; then
+        WHATSAPP_PROVISIONING_SECRET=$(cat "$PROVISIONING_SECRET_FILE")
+    else
+        WHATSAPP_PROVISIONING_SECRET=$(gen_token)
+        echo "$WHATSAPP_PROVISIONING_SECRET" > "$PROVISIONING_SECRET_FILE"
+        chmod 600 "$PROVISIONING_SECRET_FILE"
+    fi
 fi
-export WHATSAPP_PICKLE_KEY
+export WHATSAPP_PROVISIONING_SECRET
 
 echo "Generating config from template..."
-envsubst '${WHATSAPP_AS_TOKEN} ${WHATSAPP_HS_TOKEN} ${WHATSAPP_PICKLE_KEY} ${MULTICHAT_BRIDGE_STATUS_ENDPOINT} ${SYNAPSE_SERVER_NAME}' \
+envsubst '${WHATSAPP_AS_TOKEN} ${WHATSAPP_HS_TOKEN} ${WHATSAPP_PROVISIONING_SECRET} ${MULTICHAT_BRIDGE_STATUS_ENDPOINT} ${SYNAPSE_SERVER_NAME}' \
     < "$TEMPLATE_DIR/config.yaml" > "$CONFIG_FILE"
 
 echo "Generating registration from template..."
 envsubst '${WHATSAPP_AS_TOKEN} ${WHATSAPP_HS_TOKEN} ${SYNAPSE_SERVER_NAME}' \
     < "$TEMPLATE_DIR/registration.yaml" > "$REGISTRATION_FILE"
 
-chown 1337:1337 "$CONFIG_FILE" "$REGISTRATION_FILE" "$PICKLE_KEY_FILE" 2>/dev/null || true
+chown 1337:1337 "$CONFIG_FILE" "$REGISTRATION_FILE" 2>/dev/null || true
 chmod 600 "$CONFIG_FILE" "$REGISTRATION_FILE"
 
 if [ -d "$SYNAPSE_APPSERVICES_DIR" ]; then
     NEED_SYNAPSE_RESTART=false
     TARGET_REGISTRATION="$SYNAPSE_APPSERVICES_DIR/whatsapp.yaml"
-    # Keep Synapse registration exactly in sync with the bridge registration.
-    # Partial token matching can keep stale files around and cause 401 as_token failures.
-    if [ ! -f "$TARGET_REGISTRATION" ] || ! cmp -s "$REGISTRATION_FILE" "$TARGET_REGISTRATION"; then
+    # Compare tokens rather than full file contents. The Synapse placeholder
+    # template and bridge template can differ in whitespace/quoting yet render
+    # identical tokens -- byte-comparing would cause a spurious Synapse restart.
+    extract_as_token() {
+        [ -f "$1" ] || return 0
+        grep '^as_token:' "$1" 2>/dev/null | head -1 | sed -e 's/^as_token:[[:space:]]*//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+    }
+    CURRENT_AS_TOKEN=$(extract_as_token "$REGISTRATION_FILE")
+    TARGET_AS_TOKEN=$(extract_as_token "$TARGET_REGISTRATION")
+    if [ ! -f "$TARGET_REGISTRATION" ] || [ -z "$TARGET_AS_TOKEN" ] || [ "$CURRENT_AS_TOKEN" != "$TARGET_AS_TOKEN" ]; then
         echo "Syncing registration to Synapse appservices..."
         cp "$REGISTRATION_FILE" "$TARGET_REGISTRATION"
         chown 991:991 "$TARGET_REGISTRATION" 2>/dev/null || true
